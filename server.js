@@ -25,8 +25,10 @@ const authenticateToken = (req, res, next) => {
 };
 const express = require('express');
 const bodyParser = require('body-parser');
-const sqlite3 = require('sqlite3').verbose();
 const cors = require('cors');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -38,14 +40,205 @@ app.use(bodyParser.json());
 const fs = require('fs');
 const path = require('path');
 
+// PostgreSQL setup
+const { Pool } = require('pg');
+
 // Database verbinding
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Test database verbinding
+db.connect()
+  .then(() => {
+    console.log('Verbonden met PostgreSQL database');
+    initializeDatabase();
+  })
+  .catch(err => {
+    console.error('Database verbinding fout:', err);
+  });
+
+// Database initialisatie
+async function initializeDatabase() {
+  try {
+    // Check of users tabel bestaat
+    const result = await db.query(`
+      SELECT EXISTS (
+        SELECT FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_name = 'users'
+      );
+    `);
+    
+    if (!result.rows[0].exists) {
+      console.log('Database tabellen bestaan nog niet. Schema initialiseren...');
+      await createTables();
+    } else {
+      console.log('Database tabellen bestaan al.');
+    }
+  } catch (err) {
+    console.error('Fout bij database initialisatie:', err);
+  }
+}
+
+// Maak tabellen aan
+async function createTables() {
+  const schema = `
+    -- Gebruikers tabel
+    CREATE TABLE IF NOT EXISTS users (
+        user_id SERIAL PRIMARY KEY,
+        username VARCHAR(100) NOT NULL UNIQUE,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(100) UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        join_date DATE NOT NULL DEFAULT CURRENT_DATE,
+        height FLOAT,
+        weight FLOAT,
+        last_login TIMESTAMP
+    );
+
+    -- Categorieën tabel
+    CREATE TABLE IF NOT EXISTS categories (
+        category_id SERIAL PRIMARY KEY,
+        name VARCHAR(50) UNIQUE NOT NULL
+    );
+
+    -- Oefeningen tabel
+    CREATE TABLE IF NOT EXISTS exercises (
+        exercise_id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        category_id INTEGER REFERENCES categories(category_id),
+        equipment TEXT,
+        description TEXT,
+        instructions TEXT,
+        video_url VARCHAR(255)
+    );
+
+    -- Apparatuur tabel
+    CREATE TABLE IF NOT EXISTS equipment (
+        equipment_id VARCHAR(20) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        location VARCHAR(100),
+        last_maintenance DATE
+    );
+
+    -- NFC Tags tabel
+    CREATE TABLE IF NOT EXISTS nfc_tags (
+        tag_id VARCHAR(100) PRIMARY KEY,
+        equipment_id VARCHAR(20) NOT NULL REFERENCES equipment(equipment_id),
+        exercise_id INTEGER NOT NULL REFERENCES exercises(exercise_id),
+        date_registered DATE NOT NULL DEFAULT CURRENT_DATE,
+        last_scanned TIMESTAMP
+    );
+
+    -- Workouts tabel
+    CREATE TABLE IF NOT EXISTS workouts (
+        workout_id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(user_id),
+        date DATE NOT NULL DEFAULT CURRENT_DATE,
+        start_time TIME,
+        end_time TIME,
+        notes TEXT
+    );
+
+    -- Workout oefeningen tabel
+    CREATE TABLE IF NOT EXISTS workout_exercises (
+        workout_exercise_id SERIAL PRIMARY KEY,
+        workout_id INTEGER NOT NULL REFERENCES workouts(workout_id),
+        exercise_id INTEGER NOT NULL REFERENCES exercises(exercise_id),
+        equipment_id VARCHAR(20) REFERENCES equipment(equipment_id)
+    );
+
+    -- Sets tabel
+    CREATE TABLE IF NOT EXISTS exercise_sets (
+        set_id SERIAL PRIMARY KEY,
+        workout_exercise_id INTEGER NOT NULL REFERENCES workout_exercises(workout_exercise_id),
+        set_number INTEGER NOT NULL,
+        weight FLOAT,
+        reps INTEGER,
+        duration INTEGER,
+        notes TEXT
+    );
+
+    -- Persoonlijke records tabel
+    CREATE TABLE IF NOT EXISTS personal_records (
+        pr_id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(user_id),
+        exercise_id INTEGER NOT NULL REFERENCES exercises(exercise_id),
+        value FLOAT NOT NULL,
+        date_achieved DATE NOT NULL DEFAULT CURRENT_DATE,
+        type VARCHAR(20) NOT NULL
+    );
+
+    -- Progressie tracking tabel
+    CREATE TABLE IF NOT EXISTS progress_tracking (
+        progress_id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(user_id),
+        date DATE NOT NULL DEFAULT CURRENT_DATE,
+        weight FLOAT,
+        body_fat_percentage FLOAT
+    );
+
+    -- Doelen tabel
+    CREATE TABLE IF NOT EXISTS user_goals (
+        goal_id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(user_id),
+        goal_name VARCHAR(100) NOT NULL,
+        date_added DATE NOT NULL DEFAULT CURRENT_DATE,
+        completed BOOLEAN DEFAULT FALSE
+    );
+
+    -- Prestaties tabel
+    CREATE TABLE IF NOT EXISTS user_achievements (
+        achievement_id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(user_id),
+        name VARCHAR(100) NOT NULL,
+        date_achieved DATE NOT NULL DEFAULT CURRENT_DATE,
+        description TEXT
+    );
+
+    -- Voorgevulde data
+    INSERT INTO categories (name) VALUES 
+    ('Borst'), ('Benen'), ('Rug'), ('Schouders'), ('Armen'), ('Kern'), ('Cardio'), ('Alle')
+    ON CONFLICT (name) DO NOTHING;
+
+    INSERT INTO equipment (equipment_id, name, location) VALUES
+    ('BP001', 'Bench Press Station', 'Free Weights Area'),
+    ('SQ001', 'Squat Rack', 'Free Weights Area'),
+    ('LP001', 'Leg Press Machine', 'Machine Area'),
+    ('CR001', 'Calf Raise Machine', 'Machine Area'),
+    ('CB001', 'Cable Machine', 'Cable Station')
+    ON CONFLICT (equipment_id) DO NOTHING;
+
+    INSERT INTO exercises (name, category_id, equipment) VALUES
+    ('Bankdrukken', 1, 'Barbell, Bench'),
+    ('Squats', 2, 'Barbell, Squat Rack'),
+    ('Shoulder Press', 4, 'Dumbbells, Bench'),
+    ('Deadlift', 3, 'Barbell'),
+    ('Bicep Curls', 5, 'Dumbbells'),
+    ('Tricep Extensions', 5, 'Cable Machine'),
+    ('Lat Pulldown', 3, 'Cable Machine'),
+    ('Leg Press', 2, 'Leg Press Machine'),
+    ('Calf Raises', 2, 'Calf Raise Machine'),
+    ('Chest Fly', 1, 'Cable Machine, Dumbbells')
+    ON CONFLICT DO NOTHING;
+  `;
+
+  try {
+    await db.query(schema);
+    console.log('Database schema succesvol aangemaakt!');
+  } catch (err) {
+    console.error('Fout bij aanmaken schema:', err);
+  }
+}
 // Database verbinding met better-sqlite3
-const db = new Database('./database/gymtracker.db');
+const sqliteDb = new Database('./database/gymtracker.db');
 console.log('Verbonden met de SQLite database.');
 
 // Controleer of de database al is geïnitialiseerd
 try {
-  const result = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get();
+  const result = sqliteDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get();
   
   if (!result) {
     console.log('Database tabellen bestaan nog niet. Schema initialiseren...');
@@ -66,7 +259,7 @@ try {
       statements.forEach((statement, index) => {
         if (statement.trim()) {
           try {
-            db.exec(statement + ';');
+            sqliteDb.exec(statement + ';');
             console.log(`SQL statement #${index+1} succesvol uitgevoerd`);
           } catch (err) {
             console.error(`Fout bij uitvoeren SQL statement #${index+1}:`, err.message);
@@ -86,7 +279,8 @@ try {
 // API Routes
 
 // 1. NFC tag opzoeken
-app.get('/api/nfc-tags/:tagId', (req, res) => {
+// 1. NFC tag opzoeken
+app.get('/api/nfc-tags/:tagId', async (req, res) => {
   const { tagId } = req.params;
   
   const sql = `
@@ -97,15 +291,27 @@ app.get('/api/nfc-tags/:tagId', (req, res) => {
     JOIN equipment e ON t.equipment_id = e.equipment_id
     JOIN exercises ex ON t.exercise_id = ex.exercise_id
     JOIN categories c ON ex.category_id = c.category_id
-    WHERE t.tag_id = ?
+    WHERE t.tag_id = $1
   `;
   
-try {
-  const row = db.prepare(sql).get(params);
-  res.json(row);
-} catch (err) {
-  res.status(500).json({ error: err.message });
-}
+  try {
+    const result = await db.query(sql, [tagId]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'NFC tag niet gevonden' });
+    }
+    
+    // Update last_scanned timestamp
+    await db.query(
+      'UPDATE nfc_tags SET last_scanned = CURRENT_TIMESTAMP WHERE tag_id = $1',
+      [tagId]
+    );
+    
+    return res.json(result.rows[0]);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // 2. NFC tag registreren of bijwerken
 app.post('/api/nfc-tags', (req, res) => {
