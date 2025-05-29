@@ -39,31 +39,23 @@ const fs = require('fs');
 const path = require('path');
 
 // Database verbinding
-const db = new sqlite3.Database('./database/gymtracker.db', (err) => {
-  if (err) {
-    console.error('Kon geen verbinding maken met database:', err.message);
-  } else {
-    console.log('Verbonden met de SQLite database.');
-    
-    // Controleer of de database al is geïnitialiseerd
-// Wijzig dit deel in je database verbindingscode
+// Database verbinding met better-sqlite3
+const db = new Database('./database/gymtracker.db');
+console.log('Verbonden met de SQLite database.');
+
 // Controleer of de database al is geïnitialiseerd
-db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='users'", (err, row) => {
-  if (err) {
-    console.error('Fout bij controleren van tabellen:', err.message);
-  } else if (!row) {
+try {
+  const result = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='users'").get();
+  
+  if (!result) {
     console.log('Database tabellen bestaan nog niet. Schema initialiseren...');
     
     // Lees schema.sql bestand
     const schemaPath = path.join(__dirname, './database/schema.sql');
     
-    try {
-      // Controleer of het bestand bestaat
-      if (!fs.existsSync(schemaPath)) {
-        console.error('Schema bestand niet gevonden op:', schemaPath);
-        return;
-      }
-      
+    if (!fs.existsSync(schemaPath)) {
+      console.error('Schema bestand niet gevonden op:', schemaPath);
+    } else {
       const schemaSql = fs.readFileSync(schemaPath, 'utf8');
       console.log('Schema bestand gelezen, lengte:', schemaSql.length);
       
@@ -71,33 +63,26 @@ db.get("SELECT name FROM sqlite_master WHERE type='table' AND name='users'", (er
       const statements = schemaSql.split(';').filter(stmt => stmt.trim());
       console.log('Aantal SQL statements gevonden:', statements.length);
       
-      db.serialize(() => {
-        statements.forEach((statement, index) => {
-          if (statement.trim()) {
-            db.run(statement + ';', err => {
-              if (err) {
-                console.error(`Fout bij uitvoeren SQL statement #${index+1}:`, err.message);
-                console.error('SQL statement:', statement);
-              } else {
-                console.log(`SQL statement #${index+1} succesvol uitgevoerd`);
-              }
-            });
+      statements.forEach((statement, index) => {
+        if (statement.trim()) {
+          try {
+            db.exec(statement + ';');
+            console.log(`SQL statement #${index+1} succesvol uitgevoerd`);
+          } catch (err) {
+            console.error(`Fout bij uitvoeren SQL statement #${index+1}:`, err.message);
+            console.error('SQL statement:', statement);
           }
-        });
-        
-        console.log('Database schema initialisatie voltooid!');
+        }
       });
       
-    } catch (err) {
-      console.error('Fout bij lezen schema.sql bestand:', err.message);
-      console.error('Stack trace:', err.stack);
+      console.log('Database schema initialisatie voltooid!');
     }
   } else {
     console.log('Database tabellen bestaan al.');
   }
-});
-  }
-});
+} catch (err) {
+  console.error('Fout bij database initialisatie:', err.message);
+}
 // API Routes
 
 // 1. NFC tag opzoeken
@@ -115,29 +100,12 @@ app.get('/api/nfc-tags/:tagId', (req, res) => {
     WHERE t.tag_id = ?
   `;
   
-  db.get(sql, [tagId], (err, row) => {
-    if (err) {
-      return res.status(500).json({ error: err.message });
-    }
-    
-    if (!row) {
-      return res.status(404).json({ error: 'NFC tag niet gevonden' });
-    }
-    
-    // Update last_scanned timestamp
-    db.run(
-      'UPDATE nfc_tags SET last_scanned = CURRENT_TIMESTAMP WHERE tag_id = ?',
-      [tagId],
-      function(err) {
-        if (err) {
-          console.error('Fout bij updaten last_scanned:', err.message);
-        }
-      }
-    );
-    
-    return res.json(row);
-  });
-});
+try {
+  const row = db.prepare(sql).get(params);
+  res.json(row);
+} catch (err) {
+  res.status(500).json({ error: err.message });
+}
 
 // 2. NFC tag registreren of bijwerken
 app.post('/api/nfc-tags', (req, res) => {
